@@ -85,6 +85,7 @@ type ReplicaSetController struct {
 	// For example, this struct can be used (with adapters) to handle ReplicationController.
 	schema.GroupVersionKind
 
+	//为什么这里用的是interface 而不是比如kubernetes.Clientset这种，可能是为了兼容性，防止后面再出一些其它类型的client
 	kubeClient clientset.Interface
 	podControl controller.PodControlInterface
 
@@ -365,6 +366,7 @@ func (rsc *ReplicaSetController) deleteRS(obj interface{}) {
 	klog.V(4).Infof("Deleting %s %q", rsc.Kind, key)
 
 	// Delete expectations for the ReplicaSet so if we create a new one with the same name it starts clean
+	//read:这里的expectations也有一点不理解
 	rsc.expectations.DeleteExpectations(key)
 
 	rsc.queue.Add(key)
@@ -392,11 +394,14 @@ func (rsc *ReplicaSetController) addPod(obj interface{}) {
 			return
 		}
 		klog.V(4).Infof("Pod %s created: %#v.", pod.Name, pod)
+
+		// read:这里的expectations 机制需要重点关注一下
 		rsc.expectations.CreationObserved(rsKey)
 		rsc.queue.Add(rsKey)
 		return
 	}
 
+	// read: pod的eventHandler处理逻辑依然是将pod对应的replicaset对象加入queue中，而不是将pod加入到queue中。
 	// Otherwise, it's an orphan. Get a list of all matching ReplicaSets and sync
 	// them to see if anyone wants to adopt it.
 	// DO NOT observe creation because no controller should be waiting for an
@@ -565,6 +570,7 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, filteredPod
 	}
 	if diff < 0 {
 		diff *= -1
+		// read： 一次创建的pod的最大数量为burstReplicas=500
 		if diff > rsc.burstReplicas {
 			diff = rsc.burstReplicas
 		}
@@ -573,6 +579,7 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, filteredPod
 		// UID, which would require locking *across* the create, which will turn
 		// into a performance bottleneck. We should generate a UID for the pod
 		// beforehand and store it via ExpectCreations.
+		// read 需要进一步了解
 		rsc.expectations.ExpectCreations(rsKey, diff)
 		klog.V(2).InfoS("Too few replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "creating", diff)
 		// Batch the pod creates. Batch sizes start at SlowStartInitialBatchSize
@@ -583,7 +590,9 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, filteredPod
 		// prevented from spamming the API service with the pod create requests
 		// after one of its pods fails.  Conveniently, this also prevents the
 		// event spam that those failures would generate.
+		// read: 慢启动创建pod（指数增长）
 		successfulCreations, err := slowStartBatch(diff, controller.SlowStartInitialBatchSize, func() error {
+			// read: 真正创建pod的函数
 			err := rsc.podControl.CreatePods(ctx, rs.Namespace, &rs.Spec.Template, rs, metav1.NewControllerRef(rs, rsc.GroupVersionKind))
 			if err != nil {
 				if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
@@ -601,6 +610,13 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, filteredPod
 		if skippedPods := diff - successfulCreations; skippedPods > 0 {
 			klog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for %v %v/%v", skippedPods, rsc.Kind, rs.Namespace, rs.Name)
 			for i := 0; i < skippedPods; i++ {
+
+				//read expectations记录了replicaset对象在某一次调谐中期望创建/删除的pod数量，
+				// pod创建/删除完成后，replicaset controller会watch到pod的创建/删除事件，
+				// 从而调用rsc.expectations.CreationObserved方法来使期望创建/删除的pod数量减少。当有相应数量的pod创建/删除失败后，
+				// replicaset controller是不会watch到相应的pod创建/删除事件的，所以必须把本轮调谐期望创建/删除的pod数量做相应的减法，
+				// 否则本轮调谐中的期望创建/删除pod数量永远不可能小于等于0，这样的话，rsc.expectations.SatisfiedExpectations方法就只会等待expectations超时期限到达才会返回true了。
+
 				// Decrement the expected number of creates because the informer won't observe this pod
 				rsc.expectations.CreationObserved(rsKey)
 			}
@@ -616,6 +632,7 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, filteredPod
 		utilruntime.HandleError(err)
 
 		// Choose which Pods to delete, preferring those in earlier phases of startup.
+		// read: 删除那些还处于启动阶段/运行时间较短的pod
 		podsToDelete := getPodsToDelete(filteredPods, relatedPods, diff)
 
 		// Snapshot the UIDs (ns/name) of the pods we're expecting to see
@@ -681,6 +698,7 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 		return err
 	}
 
+	// read: 判断上一次对 replicaset 对象的调协操作中，调用的rsc.manageReplicas 方法是否执行完成
 	rsNeedsSync := rsc.expectations.SatisfiedExpectations(key)
 	selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
 	if err != nil {
@@ -700,16 +718,21 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 
 	// NOTE: filteredPods are pointing to objects from cache - if you need to
 	// modify them, you need to copy it first.
+	// read: claimPods 是什么意思？ ClaimPods 方法会获取一系列 Pod 的所有权，如果当前的 Pod 与 ReplicaSet 的选择器匹配就会建立从属关系，否则就会释放持有的对象，或者直接忽视无关的 Pod，建立和释放关系的方法就是 AdoptPod 和 ReleasePod，AdoptPod 会设置目标对象的 metadata.OwnerReferences 字段
+	// read: 筛选出所有符合rs.selector的pod，可能比rs的desired数量多
 	filteredPods, err = rsc.claimPods(ctx, rs, selector, filteredPods)
 	if err != nil {
 		return err
 	}
 
 	var manageReplicasErr error
+	// read: 如果上次调协已经完成 且 rs未被删除，则进行新一轮的核心调协
 	if rsNeedsSync && rs.DeletionTimestamp == nil {
+		// read：这里是做replicaset期望副本的核心调谐处理，即创删pod
 		manageReplicasErr = rsc.manageReplicas(ctx, filteredPods, rs)
 	}
 	rs = rs.DeepCopy()
+	// read: 这里具体是如何计算，当前的RS各种类型的Pod有多少个？
 	newStatus := calculateStatus(rs, filteredPods, manageReplicasErr)
 
 	// Always updates status as pods come up or die.
@@ -720,6 +743,7 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 		return err
 	}
 	// Resync the ReplicaSet after MinReadySeconds as a last line of defense to guard against clock-skew.
+	// read: 更新完的rs 可能会触发pod的增删和其他检查操作，将未稳定的rs加入queue,等待下次重新检查
 	if manageReplicasErr == nil && updatedRS.Spec.MinReadySeconds > 0 &&
 		updatedRS.Status.ReadyReplicas == *(updatedRS.Spec.Replicas) &&
 		updatedRS.Status.AvailableReplicas != *(updatedRS.Spec.Replicas) {
