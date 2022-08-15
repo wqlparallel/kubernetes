@@ -737,6 +737,7 @@ func (p *podWorkers) UpdatePod(options UpdatePodOptions) {
 		}()
 	}
 
+	// read: 下发更新任务
 	// dispatch a request to the pod worker if none are running
 	if !status.IsWorking() {
 		status.working = true
@@ -933,6 +934,7 @@ func (p *podWorkers) managePodLoop(podUpdates <-chan podWork) {
 				err = p.syncTerminatingPodFn(ctx, pod, status, update.Options.RunningPod, gracePeriod, podStatusFn)
 
 			default:
+				// read: 创建容器前的准备工作
 				isTerminal, err = p.syncPodFn(ctx, update.Options.UpdateType, pod, update.Options.MirrorPod, status)
 			}
 

@@ -262,7 +262,9 @@ func (a *HorizontalController) computeReplicasForMetrics(ctx context.Context, hp
 		return 0, "", nil, time.Time{}, fmt.Errorf(errMsg)
 	}
 
+	// read: 上次HPA的计算结果
 	specReplicas := scale.Spec.Replicas
+	// read: 当前的实际数目
 	statusReplicas := scale.Status.Replicas
 	statuses = make([]autoscalingv2.MetricStatus, len(metricSpecs))
 
@@ -606,6 +608,7 @@ func (a *HorizontalController) reconcileAutoscaler(ctx context.Context, hpaShare
 		return fmt.Errorf("failed to query scale subresource for %s: %v", reference, err)
 	}
 	setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "SucceededGetScale", "the HPA controller was able to get the target's current scale")
+	// read:目标资源的Spec.Replicas
 	currentReplicas := scale.Spec.Replicas
 	a.recordInitialRecommendation(currentReplicas, key)
 
@@ -614,7 +617,7 @@ func (a *HorizontalController) reconcileAutoscaler(ctx context.Context, hpaShare
 		metricDesiredReplicas int32
 		metricName            string
 	)
-
+	// read:期望的副本数
 	desiredReplicas := int32(0)
 	rescaleReason := ""
 
@@ -642,6 +645,7 @@ func (a *HorizontalController) reconcileAutoscaler(ctx context.Context, hpaShare
 		desiredReplicas = minReplicas
 	} else {
 		var metricTimestamp time.Time
+		// read: 依据指标进行核心计算
 		metricDesiredReplicas, metricName, metricStatuses, metricTimestamp, err = a.computeReplicasForMetrics(ctx, hpa, scale, hpa.Spec.Metrics)
 		if err != nil {
 			a.setCurrentReplicasInStatus(hpa, currentReplicas)

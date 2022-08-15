@@ -846,6 +846,15 @@ func (s ActivePodsWithRanks) Less(i, j int) bool {
 	if podutil.IsPodReady(s.Pods[i]) && podutil.IsPodReady(s.Pods[j]) {
 		readyTime1 := podReadyTime(s.Pods[i])
 		readyTime2 := podReadyTime(s.Pods[j])
+
+		// read: 可以在这里修改，保证old spotpod的raadytime 虽然比较长，但是还是被删除。修改逻辑如下
+		//if s.Pods[i].Annotations["SpotToBeRealeased"] == "true"{
+		//	readyTime1 = &metav1.Time{}
+		//}
+		//if s.Pods[j].Annotations["SpotToBeRealeased"] == "true"{
+		//	readyTime2 = &metav1.Time{}
+		//}
+
 		if !readyTime1.Equal(readyTime2) {
 			if !utilfeature.DefaultFeatureGate.Enabled(features.LogarithmicScaleDown) {
 				return afterOrZero(readyTime1, readyTime2)

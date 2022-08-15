@@ -502,6 +502,7 @@ func (o *GetOptions) Run(f cmdutil.Factory, cmd *cobra.Command, args []string) e
 
 	allErrs := []error{}
 	errs := sets.NewString()
+	// read: kubectl真正调用数据
 	infos, err := r.Infos()
 	if err != nil {
 		allErrs = append(allErrs, err)

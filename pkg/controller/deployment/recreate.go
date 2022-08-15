@@ -101,6 +101,8 @@ func oldPodsRunning(newRS *apps.ReplicaSet, oldRSs []*apps.ReplicaSet, podMap ma
 		return true
 	}
 	for rsUID, podList := range podMap {
+
+		// read： 因为即将被删除的rs，所添加的annotation都是在属于最新的rs的，所以不会被deployment的判断逻辑有影响
 		// If the pods belong to the new ReplicaSet, ignore.
 		if newRS != nil && newRS.UID == rsUID {
 			continue

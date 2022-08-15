@@ -85,7 +85,7 @@ type ReplicaSetController struct {
 	// For example, this struct can be used (with adapters) to handle ReplicationController.
 	schema.GroupVersionKind
 
-	//为什么这里用的是interface 而不是比如kubernetes.Clientset这种，可能是为了兼容性，防止后面再出一些其它类型的client
+	// read：为什么这里用的是interface 而不是比如kubernetes.Clientset这种，可能是为了兼容性，防止后面再出一些其它类型的client
 	kubeClient clientset.Interface
 	podControl controller.PodControlInterface
 
@@ -217,6 +217,7 @@ func (rsc *ReplicaSetController) Run(ctx context.Context, workers int) {
 	<-ctx.Done()
 }
 
+// read: 返回属于同一deployment的所有rs
 // getReplicaSetsWithSameController returns a list of ReplicaSets with the same
 // owner as the given ReplicaSet.
 func (rsc *ReplicaSetController) getReplicaSetsWithSameController(rs *apps.ReplicaSet) []*apps.ReplicaSet {
@@ -366,7 +367,6 @@ func (rsc *ReplicaSetController) deleteRS(obj interface{}) {
 	klog.V(4).Infof("Deleting %s %q", rsc.Kind, key)
 
 	// Delete expectations for the ReplicaSet so if we create a new one with the same name it starts clean
-	//read:这里的expectations也有一点不理解
 	rsc.expectations.DeleteExpectations(key)
 
 	rsc.queue.Add(key)
@@ -386,6 +386,7 @@ func (rsc *ReplicaSetController) addPod(obj interface{}) {
 	// If it has a ControllerRef, that's all that matters.
 	if controllerRef := metav1.GetControllerOf(pod); controllerRef != nil {
 		rs := rsc.resolveControllerRef(pod.Namespace, controllerRef)
+		// read: 新创建的pod已被其他控制器控制，且不被任何rs控制，则不会调整
 		if rs == nil {
 			return
 		}
@@ -395,7 +396,7 @@ func (rsc *ReplicaSetController) addPod(obj interface{}) {
 		}
 		klog.V(4).Infof("Pod %s created: %#v.", pod.Name, pod)
 
-		// read:这里的expectations 机制需要重点关注一下
+		// read: 观察到了对应rs的pod被成功创建，只有对应的rs的SatisfiedExpectations，才会进行下次manageReplicas 这里的expectations 机制需要重点关注一下
 		rsc.expectations.CreationObserved(rsKey)
 		rsc.queue.Add(rsKey)
 		return
@@ -579,7 +580,6 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, filteredPod
 		// UID, which would require locking *across* the create, which will turn
 		// into a performance bottleneck. We should generate a UID for the pod
 		// beforehand and store it via ExpectCreations.
-		// read 需要进一步了解
 		rsc.expectations.ExpectCreations(rsKey, diff)
 		klog.V(2).InfoS("Too few replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "creating", diff)
 		// Batch the pod creates. Batch sizes start at SlowStartInitialBatchSize
@@ -628,6 +628,7 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, filteredPod
 		}
 		klog.V(2).InfoS("Too many replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "deleting", diff)
 
+		// read: 这里的relatedPods用于 选择哪些pod该删除时的排序工作（同一node上的pod过多时，会被删除）
 		relatedPods, err := rsc.getIndirectlyRelatedPods(rs)
 		utilruntime.HandleError(err)
 
@@ -720,6 +721,7 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 	// modify them, you need to copy it first.
 	// read: claimPods 是什么意思？ ClaimPods 方法会获取一系列 Pod 的所有权，如果当前的 Pod 与 ReplicaSet 的选择器匹配就会建立从属关系，否则就会释放持有的对象，或者直接忽视无关的 Pod，建立和释放关系的方法就是 AdoptPod 和 ReleasePod，AdoptPod 会设置目标对象的 metadata.OwnerReferences 字段
 	// read: 筛选出所有符合rs.selector的pod，可能比rs的desired数量多
+	// read: 简单来说，就是对现有集群中的pod的归属关系，进行整理
 	filteredPods, err = rsc.claimPods(ctx, rs, selector, filteredPods)
 	if err != nil {
 		return err

@@ -194,8 +194,10 @@ func (c *ReplicaCalculator) calcPlainMetricReplicas(metrics metricsclient.PodMet
 		return 0, 0, fmt.Errorf("did not receive metrics for any ready pods")
 	}
 
+	// read: 第一次计算，去除了unreadyPods、ignoredPods、missingPods
 	usageRatio, utilization := metricsclient.GetMetricUtilizationRatio(metrics, targetUtilization)
 
+	// read: 如果原始计算是需要扩容，且存在unready的pod，则需要重新计算
 	rebalanceIgnored := len(unreadyPods) > 0 && usageRatio > 1.0
 
 	if !rebalanceIgnored && len(missingPods) == 0 {
@@ -208,6 +210,7 @@ func (c *ReplicaCalculator) calcPlainMetricReplicas(metrics metricsclient.PodMet
 		return int32(math.Ceil(usageRatio * float64(readyPodCount))), utilization, nil
 	}
 
+	// read: 如果存在missing Pod 进一步抑制
 	if len(missingPods) > 0 {
 		if usageRatio < 1.0 {
 			// on a scale-down, treat missing pods as using 100% of the resource request
@@ -222,6 +225,7 @@ func (c *ReplicaCalculator) calcPlainMetricReplicas(metrics metricsclient.PodMet
 		}
 	}
 
+	// read: 如果为扩容，并且存在unready pod 更进一步抑制
 	if rebalanceIgnored {
 		// on a scale-up, treat unready pods as using 0% of the resource request
 		for podName := range unreadyPods {

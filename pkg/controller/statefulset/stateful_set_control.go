@@ -290,6 +290,7 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 	unhealthy := 0
 	var firstUnhealthyPod *v1.Pod
 
+	// read：第一个for循环，将statefulset的pod分到replicas和condemned两个数组中，其中condemned数组中的pod代表需要被删除的
 	// First we partition pods into two lists valid replicas and condemned Pods
 	for i := range pods {
 		status.Replicas++
@@ -346,6 +347,9 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 		}
 	}()
 
+	//read: 第二个for循环，当序号小于statefulset期望副本数值的pod未创建出来时，则根据statefulset对象中的pod模板，
+	// 构建出相应序号值的pod对象（此时还并没有向apiserver发起创建pod的请求，只是构建好pod结构体）
+
 	// for any empty indices in the sequence [0,set.Spec.Replicas) create a new Pod at the correct revision
 	for ord := 0; ord < replicaCount; ord++ {
 		if replicas[ord] == nil {
@@ -359,6 +363,8 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 
 	// sort the condemned Pods by their ordinals
 	sort.Sort(ascendingOrdinal(condemned))
+
+	// read: 第三个和第四个for循环，遍历replicas和condemned两个数组，找到非healthy状态的最小序号的pod记录下来，并记录序号
 
 	// find the first unhealthy Pod
 	for i := range replicas {
@@ -390,6 +396,8 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 	}
 
 	monotonic := !allowsBurst(set)
+
+	// read: 第五个for循环，遍历replicas数组，处理statefulset的pod，主要是做pod的创建
 
 	// Examine each replica with respect to its ordinal
 	for i := range replicas {
@@ -549,6 +557,8 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 		}
 	}
 
+	// read: 判断statefulset的更新策略，若为OnDelete，则直接return（使用了该更新策略，则需要人工删除pod后才会重建相应序号的pod）
+
 	// for the OnDelete strategy we short circuit. Pods will be updated when they are manually deleted.
 	if set.Spec.UpdateStrategy.Type == apps.OnDeleteStatefulSetStrategyType {
 		return &status, nil
@@ -564,6 +574,7 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 		)
 	}
 
+	// read: 获取滚动更新配置中的Partition值，当statefulset进行滚动更新时，小于等于该序号的pod将不会被更新
 	// we compute the minimum ordinal of the target sequence for a destructive update based on the strategy.
 	updateMin := 0
 	if set.Spec.UpdateStrategy.RollingUpdate != nil {
