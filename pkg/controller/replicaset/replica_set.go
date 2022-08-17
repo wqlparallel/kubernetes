@@ -70,6 +70,12 @@ const (
 
 	// The number of times we retry updating a ReplicaSet's status.
 	statusUpdateRetries = 1
+
+	// AnnotationSpotPodReleaseTime signals wheather spotPod is to be released.
+	AnnotationSpotPodReleaseTime = "k8s.aliyun.com/spot-pod-release-time"
+
+	// The annotation
+	AnnotationSpotPodOldReference = "k8s.aliyun.com/spot-pod-old-reference"
 )
 
 // ReplicaSetController is responsible for synchronizing ReplicaSet objects stored
@@ -406,6 +412,12 @@ func (rsc *ReplicaSetController) updatePod(old, cur interface{}) {
 	}
 
 	labelChanged := !reflect.DeepEqual(curPod.Labels, oldPod.Labels)
+	// 判断annotation spotReleasedTime 是否被设置
+	//AnnotationIsSet := func(field string, old *v1.Pod, cur *v1.Pod){
+	//	if
+	//}
+	//AnnotationSpotPodReleaseTimeFirstSet :=
+
 	if curPod.DeletionTimestamp != nil {
 		// when a pod is deleted gracefully it's deletion timestamp is first modified to reflect a grace period,
 		// and after such time has passed, the kubelet actually deletes it from the store. We receive an update
@@ -505,6 +517,8 @@ func (rsc *ReplicaSetController) deletePod(obj interface{}) {
 		return
 	}
 	klog.V(4).Infof("Pod %s/%s deleted through %v, timestamp %+v: %#v.", pod.Namespace, pod.Name, utilruntime.GetCaller(), pod.DeletionTimestamp, pod)
+
+	// read: new spotPod可能被删除，这时候expection是否需要重新调整
 	rsc.expectations.DeletionObserved(rsKey, controller.PodKey(pod))
 	rsc.queue.Add(rsKey)
 }
