@@ -1210,3 +1210,9 @@ func AddOrUpdateLabelsOnNode(kubeClient clientset.Interface, nodeName string, la
 		return nil
 	})
 }
+
+// 修改
+type PodPair struct {
+	Old *v1.Pod
+	New []*v1.Pod
+}

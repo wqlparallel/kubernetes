@@ -71,6 +71,14 @@ const (
 
 	// The number of times we retry updating a ReplicaSet's status.
 	statusUpdateRetries = 1
+
+	// AnnotationSpotPodReleaseTime signals wheather spotPod is to be released.
+	AnnotationSpotPodReleaseTime = "k8s.aliyun.com/spot-pod-release-time"
+
+	// AnnotationSpotPodOldReference is used by news spotPod to point to the old spotPod.
+	AnnotationSpotPodOldReference = "k8s.aliyun.com/spot-pod-old-reference"
+
+	AnnotationEciSpotStrategy = "k8s.aliyun.com/eci-spot-strategy"
 )
 
 // ReplicaSetController is responsible for synchronizing ReplicaSet objects stored
@@ -410,6 +418,21 @@ func (rsc *ReplicaSetController) updatePod(old, cur interface{}) {
 	}
 
 	labelChanged := !reflect.DeepEqual(curPod.Labels, oldPod.Labels)
+
+	// Pod to be realeased
+	AnnotationIsChanged := func(oldPodAnnotation, curPodAnnotation map[string]string) bool {
+		oldtime, ok1 := oldPodAnnotation[AnnotationSpotPodReleaseTime]
+		newtime, ok2 := oldPodAnnotation[AnnotationSpotPodReleaseTime]
+		if ok1 && ok2 {
+			return !reflect.DeepEqual(oldtime, newtime)
+		}
+		if ok1 || ok2 {
+			return true
+		}
+		return false
+	}
+	annotationIsChanged := AnnotationIsChanged(oldPod.Annotations, curPod.Annotations)
+
 	if curPod.DeletionTimestamp != nil {
 		// when a pod is deleted gracefully it's deletion timestamp is first modified to reflect a grace period,
 		// and after such time has passed, the kubelet actually deletes it from the store. We receive an update
@@ -427,12 +450,19 @@ func (rsc *ReplicaSetController) updatePod(old, cur interface{}) {
 	curControllerRef := metav1.GetControllerOf(curPod)
 	oldControllerRef := metav1.GetControllerOf(oldPod)
 	controllerRefChanged := !reflect.DeepEqual(curControllerRef, oldControllerRef)
-	if controllerRefChanged && oldControllerRef != nil {
+	// 修改： 如果annotation设置了，即使controllerRef没有改变也要入队
+	if (controllerRefChanged || annotationIsChanged) && oldControllerRef != nil {
 		// The ControllerRef was changed. Sync the old controller, if any.
 		if rs := rsc.resolveControllerRef(oldPod.Namespace, oldControllerRef); rs != nil {
 			rsc.enqueueRS(rs)
 		}
 	}
+	//if controllerRefChanged && oldControllerRef != nil {
+	//	// The ControllerRef was changed. Sync the old controller, if any.
+	//	if rs := rsc.resolveControllerRef(oldPod.Namespace, oldControllerRef); rs != nil {
+	//		rsc.enqueueRS(rs)
+	//	}
+	//}
 
 	// If it has a ControllerRef, that's all that matters.
 	if curControllerRef != nil {
@@ -460,7 +490,18 @@ func (rsc *ReplicaSetController) updatePod(old, cur interface{}) {
 
 	// Otherwise, it's an orphan. If anything changed, sync matching controllers
 	// to see if anyone wants to adopt it now.
-	if labelChanged || controllerRefChanged {
+	//if labelChanged || controllerRefChanged {
+	//	rss := rsc.getPodReplicaSets(curPod)
+	//	if len(rss) == 0 {
+	//		return
+	//	}
+	//	klog.V(4).Infof("Orphan Pod %s updated, objectMeta %+v -> %+v.", curPod.Name, oldPod.ObjectMeta, curPod.ObjectMeta)
+	//	for _, rs := range rss {
+	//		rsc.enqueueRS(rs)
+	//	}
+	//}
+	// 修改
+	if labelChanged || controllerRefChanged || annotationIsChanged {
 		rss := rsc.getPodReplicaSets(curPod)
 		if len(rss) == 0 {
 			return
@@ -642,6 +683,150 @@ func (rsc *ReplicaSetController) manageReplicas(filteredPods []*v1.Pod, rs *apps
 	}
 
 	return nil
+}
+
+// 修改
+// spotManageReplicas checks and updates replicas for the given ReplicaSet with spot pod.
+// Does NOT modify <filteredPods>.
+// It will requeue the replica set in case of an error while creating/deleting pods.
+func (rsc *ReplicaSetController) spotManageReplicas(filteredPods []*v1.Pod, rs *apps.ReplicaSet) error {
+	// toBeReleasedPods 即将被删除的pods；stablePodsWithOld 还存在对应的oldPod的
+	var toBeReleasedPods, stablePodsWithOld []*v1.Pod
+
+	diff := len(filteredPods) - int(*(rs.Spec.Replicas))
+	rsKey, err := controller.KeyFunc(rs)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for %v %#v: %v", rsc.Kind, rs, err))
+		return nil
+	}
+	if diff < 0 {
+		diff *= -1
+		if diff > rsc.burstReplicas {
+			diff = rsc.burstReplicas
+		}
+		// TODO: Track UIDs of creates just like deletes. The problem currently
+		// is we'd need to wait on the result of a create to record the pod's
+		// UID, which would require locking *across* the create, which will turn
+		// into a performance bottleneck. We should generate a UID for the pod
+		// beforehand and store it via ExpectCreations.
+		rsc.expectations.ExpectCreations(rsKey, diff)
+		klog.V(2).InfoS("Too few replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "creating", diff)
+		// Batch the pod creates. Batch sizes start at SlowStartInitialBatchSize
+		// and double with each successful iteration in a kind of "slow start".
+		// This handles attempts to start large numbers of pods that would
+		// likely all fail with the same error. For example a project with a
+		// low quota that attempts to create a large number of pods will be
+		// prevented from spamming the API service with the pod create requests
+		// after one of its pods fails.  Conveniently, this also prevents the
+		// event spam that those failures would generate.
+		successfulCreations, err := slowStartBatch(diff, controller.SlowStartInitialBatchSize, func() error {
+			err := rsc.podControl.CreatePods(rs.Namespace, &rs.Spec.Template, rs, metav1.NewControllerRef(rs, rsc.GroupVersionKind))
+			if err != nil {
+				if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+					// if the namespace is being terminated, we don't have to do
+					// anything because any creation will fail
+					return nil
+				}
+			}
+			return err
+		})
+
+		// Any skipped pods that we never attempted to start shouldn't be expected.
+		// The skipped pods will be retried later. The next controller resync will
+		// retry the slow start process.
+		if skippedPods := diff - successfulCreations; skippedPods > 0 {
+			klog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for %v %v/%v", skippedPods, rsc.Kind, rs.Namespace, rs.Name)
+			for i := 0; i < skippedPods; i++ {
+				// Decrement the expected number of creates because the informer won't observe this pod
+				rsc.expectations.CreationObserved(rsKey)
+			}
+		}
+		return err
+	} else if diff > 0 {
+		if diff > rsc.burstReplicas {
+			diff = rsc.burstReplicas
+		}
+		klog.V(2).InfoS("Too many replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "deleting", diff)
+
+		relatedPods, err := rsc.getIndirectlyRelatedPods(rs)
+		utilruntime.HandleError(err)
+
+		// Choose which Pods to delete, preferring those in earlier phases of startup.
+		podsToDelete := getPodsToDelete(filteredPods, relatedPods, diff)
+
+		// Snapshot the UIDs (ns/name) of the pods we're expecting to see
+		// deleted, so we know to record their expectations exactly once either
+		// when we see it as an update of the deletion timestamp, or as a delete.
+		// Note that if the labels on a pod/rs change in a way that the pod gets
+		// orphaned, the rs will only wake up after the expectations have
+		// expired even if other pods are deleted.
+		rsc.expectations.ExpectDeletions(rsKey, getPodKeys(podsToDelete))
+
+		errCh := make(chan error, diff)
+		var wg sync.WaitGroup
+		wg.Add(diff)
+		for _, pod := range podsToDelete {
+			go func(targetPod *v1.Pod) {
+				defer wg.Done()
+				if err := rsc.podControl.DeletePod(rs.Namespace, targetPod.Name, rs); err != nil {
+					// Decrement the expected number of deletes because the informer won't observe this deletion
+					podKey := controller.PodKey(targetPod)
+					rsc.expectations.DeletionObserved(rsKey, podKey)
+					if !apierrors.IsNotFound(err) {
+						klog.V(2).Infof("Failed to delete %v, decremented expectations for %v %s/%s", podKey, rsc.Kind, rs.Namespace, rs.Name)
+						errCh <- err
+					}
+				}
+			}(pod)
+		}
+		wg.Wait()
+
+		select {
+		case err := <-errCh:
+			// all errors have been reported before and they're likely to be the same, so we'll only return the first one we hit.
+			if err != nil {
+				return err
+			}
+		default:
+		}
+	}
+
+	return nil
+}
+
+// 修改
+// Does NOT modify <filteredPods>.
+func (rsc *ReplicaSetController) classifyPod(filterPods []*v1.Pod) map[*v1.Pod][]*v1.Pod {
+
+	podsPair := make(map[*v1.Pod][]*v1.Pod, 0)
+	filterPodsMap := make(map[string]*v1.Pod)
+	for _, pod := range filterPods {
+		filterPodsMap[pod.Name] = pod
+	}
+
+	for _, pod := range filterPods {
+		_, isToBeReleased := pod.Annotations[AnnotationSpotPodReleaseTime]
+		if isToBeReleased {
+			// 如果存在，则证明已经先遍历到了newPod
+			if _, ok := podsPair[pod]; !ok {
+				podsPair[pod] = make([]*v1.Pod, 0)
+			}
+			continue
+		}
+
+		if oldpod, hasOld := pod.Annotations[AnnotationSpotPodOldReference]; hasOld {
+			if _, oldExist := podsPair[filterPodsMap[oldpod]]; oldExist {
+				podsPair[filterPodsMap[oldpod]] = append(podsPair[filterPodsMap[oldpod]], pod)
+			} else {
+				podsPair[filterPodsMap[oldpod]] = []*v1.Pod{pod}
+			}
+			continue
+		}
+
+		podsPair[pod] = make([]*v1.Pod, 0)
+	}
+
+	return podsPair
 }
 
 // syncReplicaSet will sync the ReplicaSet with the given key if it has had its expectations fulfilled,
