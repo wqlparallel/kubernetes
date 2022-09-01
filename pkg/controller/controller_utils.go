@@ -584,6 +584,7 @@ func (r RealPodControl) createPods(namespace string, pod *v1.Pod, object runtime
 	return nil
 }
 
+// read: 真正的删除逻辑
 func (r RealPodControl) DeletePod(namespace string, podID string, object runtime.Object) error {
 	accessor, err := meta.Accessor(object)
 	if err != nil {
@@ -750,6 +751,72 @@ func (s ActivePods) Less(i, j int) bool {
 	return false
 }
 
+const (
+	// AnnotationSpotPodReleaseTime signals wheather spotPod is to be released.
+	AnnotationSpotPodReleaseTime = "k8s.aliyun.com/spot-pod-release-time"
+
+	// AnnotationSpotPodOldReference is used by news spotPod to point to the old spotPod.
+	AnnotationSpotPodOldReference = "k8s.aliyun.com/spot-pod-old-reference"
+
+	AnnotationEciSpotStrategy = "k8s.aliyun.com/eci-spot-strategy"
+)
+
+// ActiveSpotPods type allows custom sorting of spot pods so a controller can pick the best ones to delete.
+type ActiveSpotPods []*v1.Pod
+
+func (s ActiveSpotPods) Len() int      { return len(s) }
+func (s ActiveSpotPods) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// 修改： 这里还需要好好修改一下
+// 1. unready < ready
+// 2. old pod < new pod
+// 3. eci 按量 < spot
+// 4. spot 剩余时间短 < spot 剩余时间长
+
+func (s ActiveSpotPods) Less(i, j int) bool {
+	// 1. Unassigned < assigned
+	// If only one of the pods is unassigned, the unassigned one is smaller
+	if s[i].Spec.NodeName != s[j].Spec.NodeName && (len(s[i].Spec.NodeName) == 0 || len(s[j].Spec.NodeName) == 0) {
+		return len(s[i].Spec.NodeName) == 0
+	}
+	// 2. PodPending < PodUnknown < PodRunning
+	if podPhaseToOrdinal[s[i].Status.Phase] != podPhaseToOrdinal[s[j].Status.Phase] {
+		return podPhaseToOrdinal[s[i].Status.Phase] < podPhaseToOrdinal[s[j].Status.Phase]
+	}
+	// 3. Not ready < ready
+	// If only one of the pods is not ready, the not ready one is smaller
+	if podutil.IsPodReady(s[i]) != podutil.IsPodReady(s[j]) {
+		return !podutil.IsPodReady(s[i])
+	}
+
+	// 修改： old pod < new pod
+	if s[i].Annotations[AnnotationSpotPodOldReference] != s[j].Annotations[AnnotationSpotPodOldReference] {
+		return s[i].Annotations[AnnotationSpotPodOldReference] != ""
+	}
+	// todo： 修改 按量 < spot
+
+	// 4. Been ready for empty time < less time < more time
+	// If both pods are ready, the latest ready one is smaller
+	// read: 这里也可能需要适配一下，ready time 时间长有可能即将被释放
+	if podutil.IsPodReady(s[i]) && podutil.IsPodReady(s[j]) {
+		readyTime1 := podReadyTime(s[i])
+		readyTime2 := podReadyTime(s[j])
+		if !readyTime1.Equal(readyTime2) {
+			return afterOrZero(readyTime1, readyTime2)
+		}
+	}
+	// 5. Pods with containers with higher restart counts < lower restart counts
+	if maxContainerRestarts(s[i]) != maxContainerRestarts(s[j]) {
+		return maxContainerRestarts(s[i]) > maxContainerRestarts(s[j])
+	}
+	// 6. Empty creation time pods < newer pods < older pods
+	if !s[i].CreationTimestamp.Equal(&s[j].CreationTimestamp) {
+		return afterOrZero(&s[i].CreationTimestamp, &s[j].CreationTimestamp)
+	}
+	return false
+
+}
+
 // ActivePodsWithRanks is a sortable list of pods and a list of corresponding
 // ranks which will be considered during sorting.  The two lists must have equal
 // length.  After sorting, the pods will be ordered as follows, applying each
@@ -841,6 +908,7 @@ func (s ActivePodsWithRanks) Less(i, j int) bool {
 	}
 	// TODO: take availability into account when we push minReadySeconds information from deployment into pods,
 	//       see https://github.com/kubernetes/kubernetes/issues/22065
+
 	// 6. Been ready for empty time < less time < more time
 	// If both pods are ready, the latest ready one is smaller
 	if podutil.IsPodReady(s.Pods[i]) && podutil.IsPodReady(s.Pods[j]) {
@@ -1215,4 +1283,73 @@ func AddOrUpdateLabelsOnNode(kubeClient clientset.Interface, nodeName string, la
 type PodPair struct {
 	Old *v1.Pod
 	New []*v1.Pod
+}
+
+// todo:如果存在多个new pod，可能需要更精细的排序
+func choseInPair(pair *PodPair) *v1.Pod {
+	for _, newPod := range pair.New {
+		if podutil.IsPodReady(newPod) {
+			return newPod
+		}
+	}
+	return pair.Old
+}
+
+// ActiveSpotPods type allows custom sorting of spot pods so a controller can pick the best ones to delete.
+type ActivePodPairs []*PodPair
+
+func (s ActivePodPairs) Len() int      { return len(s) }
+func (s ActivePodPairs) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// 修改： 这里还需要好好修改一下
+// 1. unready < ready
+// 2. old pod < new pod
+// 3. eci 按量 < spot
+// 4. spot 剩余时间短 < spot 剩余时间长
+
+func (s ActivePodPairs) Less(i, j int) bool {
+	podi := choseInPair(s[i])
+	podj := choseInPair(s[j])
+
+	// 1. Unassigned < assigned
+	// If only one of the pods is unassigned, the unassigned one is smaller
+	if podi.Spec.NodeName != podj.Spec.NodeName && (len(podi.Spec.NodeName) == 0 || len(podj.Spec.NodeName) == 0) {
+		return len(podi.Spec.NodeName) == 0
+	}
+	// 2. PodPending < PodUnknown < PodRunning
+	if podPhaseToOrdinal[podi.Status.Phase] != podPhaseToOrdinal[podj.Status.Phase] {
+		return podPhaseToOrdinal[podi.Status.Phase] < podPhaseToOrdinal[podj.Status.Phase]
+	}
+	// 3. Not ready < ready
+	// If only one of the pods is not ready, the not ready one is smaller
+	if podutil.IsPodReady(podi) != podutil.IsPodReady(podj) {
+		return !podutil.IsPodReady(podi)
+	}
+
+	// 修改： old pod < new pod
+	if podi.Annotations[AnnotationSpotPodOldReference] != podj.Annotations[AnnotationSpotPodOldReference] {
+		return podi.Annotations[AnnotationSpotPodOldReference] != ""
+	}
+	// todo： 修改 按量 < spot
+
+	// 4. Been ready for empty time < less time < more time
+	// If both pods are ready, the latest ready one is smaller
+	// read: 这里也可能需要适配一下，ready time 时间长有可能即将被释放
+	if podutil.IsPodReady(podi) && podutil.IsPodReady(podj) {
+		readyTime1 := podReadyTime(podi)
+		readyTime2 := podReadyTime(podj)
+		if !readyTime1.Equal(readyTime2) {
+			return afterOrZero(readyTime1, readyTime2)
+		}
+	}
+	// 5. Pods with containers with higher restart counts < lower restart counts
+	if maxContainerRestarts(podi) != maxContainerRestarts(podj) {
+		return maxContainerRestarts(podi) > maxContainerRestarts(podj)
+	}
+	// 6. Empty creation time pods < newer pods < older pods
+	if !podi.CreationTimestamp.Equal(&podj.CreationTimestamp) {
+		return afterOrZero(&podi.CreationTimestamp, &podj.CreationTimestamp)
+	}
+	return false
+
 }

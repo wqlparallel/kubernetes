@@ -73,12 +73,10 @@ const (
 	statusUpdateRetries = 1
 
 	// AnnotationSpotPodReleaseTime signals wheather spotPod is to be released.
-	AnnotationSpotPodReleaseTime = "k8s.aliyun.com/spot-pod-release-time"
+	AnnotationSpotPodReleaseTime = "k8s.aliyun.com/eci-release-time"
 
 	// AnnotationSpotPodOldReference is used by news spotPod to point to the old spotPod.
-	AnnotationSpotPodOldReference = "k8s.aliyun.com/spot-pod-old-reference"
-
-	AnnotationEciSpotStrategy = "k8s.aliyun.com/eci-spot-strategy"
+	AnnotationSpotPodOldReference = "k8s.aliyun.com/old-reference"
 )
 
 // ReplicaSetController is responsible for synchronizing ReplicaSet objects stored
@@ -405,6 +403,7 @@ func (rsc *ReplicaSetController) addPod(obj interface{}) {
 	}
 }
 
+// read: 对于我们新添的annotation,都需要添加update
 // When a pod is updated, figure out what replica set/s manage it and wake them
 // up. If the labels of the pod have changed we need to awaken both the old
 // and new replica set. old and cur must be *v1.Pod types.
@@ -420,18 +419,14 @@ func (rsc *ReplicaSetController) updatePod(old, cur interface{}) {
 	labelChanged := !reflect.DeepEqual(curPod.Labels, oldPod.Labels)
 
 	// Pod to be realeased
-	AnnotationIsChanged := func(oldPodAnnotation, curPodAnnotation map[string]string) bool {
-		oldtime, ok1 := oldPodAnnotation[AnnotationSpotPodReleaseTime]
-		newtime, ok2 := oldPodAnnotation[AnnotationSpotPodReleaseTime]
-		if ok1 && ok2 {
-			return !reflect.DeepEqual(oldtime, newtime)
-		}
-		if ok1 || ok2 {
-			return true
-		}
-		return false
+	specifyAnnotationIsChanged := func(oldPodAnnotation, curPodAnnotation map[string]string) bool {
+		return !reflect.DeepEqual(oldPodAnnotation[AnnotationSpotPodReleaseTime], curPodAnnotation[AnnotationSpotPodReleaseTime]) || !reflect.DeepEqual(oldPodAnnotation[AnnotationSpotPodOldReference], curPodAnnotation[AnnotationSpotPodOldReference])
 	}
-	annotationIsChanged := AnnotationIsChanged(oldPod.Annotations, curPod.Annotations)
+	annotationIsChanged := specifyAnnotationIsChanged(oldPod.Annotations, curPod.Annotations)
+	//测试
+	if annotationIsChanged {
+		klog.V(4).Infof("Spot Pod %s annotation updated", curPod.Name)
+	}
 
 	if curPod.DeletionTimestamp != nil {
 		// when a pod is deleted gracefully it's deletion timestamp is first modified to reflect a grace period,
@@ -691,14 +686,22 @@ func (rsc *ReplicaSetController) manageReplicas(filteredPods []*v1.Pod, rs *apps
 // It will requeue the replica set in case of an error while creating/deleting pods.
 func (rsc *ReplicaSetController) spotManageReplicas(filteredPods []*v1.Pod, rs *apps.ReplicaSet) error {
 	// toBeReleasedPods 即将被删除的pods；stablePodsWithOld 还存在对应的oldPod的
-	var toBeReleasedPods, stablePodsWithOld []*v1.Pod
+	podPairs := rsc.classifyPod(filteredPods)
+	// 测试
+	for _, pair := range podPairs {
+		klog.V(4).Infof("podsPair old is %v", pair.Old.Name)
+		for _, new := range pair.New {
+			klog.V(4).Infof("podsPair new is %v,oldRef is %v", new.Name, new.Annotations[AnnotationSpotPodOldReference])
+		}
+	}
 
-	diff := len(filteredPods) - int(*(rs.Spec.Replicas))
+	diff := len(podPairs) - int(*(rs.Spec.Replicas))
 	rsKey, err := controller.KeyFunc(rs)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for %v %#v: %v", rsc.Kind, rs, err))
 		return nil
 	}
+
 	if diff < 0 {
 		diff *= -1
 		if diff > rsc.burstReplicas {
@@ -709,62 +712,27 @@ func (rsc *ReplicaSetController) spotManageReplicas(filteredPods []*v1.Pod, rs *
 		// UID, which would require locking *across* the create, which will turn
 		// into a performance bottleneck. We should generate a UID for the pod
 		// beforehand and store it via ExpectCreations.
-		rsc.expectations.ExpectCreations(rsKey, diff)
-		klog.V(2).InfoS("Too few replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "creating", diff)
-		// Batch the pod creates. Batch sizes start at SlowStartInitialBatchSize
-		// and double with each successful iteration in a kind of "slow start".
-		// This handles attempts to start large numbers of pods that would
-		// likely all fail with the same error. For example a project with a
-		// low quota that attempts to create a large number of pods will be
-		// prevented from spamming the API service with the pod create requests
-		// after one of its pods fails.  Conveniently, this also prevents the
-		// event spam that those failures would generate.
-		successfulCreations, err := slowStartBatch(diff, controller.SlowStartInitialBatchSize, func() error {
-			err := rsc.podControl.CreatePods(rs.Namespace, &rs.Spec.Template, rs, metav1.NewControllerRef(rs, rsc.GroupVersionKind))
-			if err != nil {
-				if apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
-					// if the namespace is being terminated, we don't have to do
-					// anything because any creation will fail
-					return nil
-				}
-			}
-			return err
-		})
-
-		// Any skipped pods that we never attempted to start shouldn't be expected.
-		// The skipped pods will be retried later. The next controller resync will
-		// retry the slow start process.
-		if skippedPods := diff - successfulCreations; skippedPods > 0 {
-			klog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for %v %v/%v", skippedPods, rsc.Kind, rs.Namespace, rs.Name)
-			for i := 0; i < skippedPods; i++ {
-				// Decrement the expected number of creates because the informer won't observe this pod
-				rsc.expectations.CreationObserved(rsKey)
-			}
+		//rsc.expectations.ExpectCreations(rsKey, diff)
+		//podsToReleased := getPodToReleased(podPairs, diff)
+		//rsc.expectations.SetExpectations(rsKey, create, delete)
+		podsToDelete := getPodsToDeleteFromPairs(podPairs, diff)
+		podsToReleased := getPodToReleased(podPairs, diff)
+		// 测试
+		for _, pod := range podsToDelete {
+			klog.V(4).Infof("Pods to delete are %v", pod.Name)
 		}
-		return err
-	} else if diff > 0 {
-		if diff > rsc.burstReplicas {
-			diff = rsc.burstReplicas
+		for _, pod := range podsToReleased {
+			klog.V(4).Infof("Pods to released are %v", pod.Name)
 		}
-		klog.V(2).InfoS("Too many replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "deleting", diff)
 
-		relatedPods, err := rsc.getIndirectlyRelatedPods(rs)
-		utilruntime.HandleError(err)
-
-		// Choose which Pods to delete, preferring those in earlier phases of startup.
-		podsToDelete := getPodsToDelete(filteredPods, relatedPods, diff)
-
-		// Snapshot the UIDs (ns/name) of the pods we're expecting to see
-		// deleted, so we know to record their expectations exactly once either
-		// when we see it as an update of the deletion timestamp, or as a delete.
-		// Note that if the labels on a pod/rs change in a way that the pod gets
-		// orphaned, the rs will only wake up after the expectations have
-		// expired even if other pods are deleted.
+		delete := len(podsToDelete)
+		create := len(podsToReleased) + diff
+		rsc.expectations.ExpectCreations(rsKey, create)
 		rsc.expectations.ExpectDeletions(rsKey, getPodKeys(podsToDelete))
 
 		errCh := make(chan error, diff)
 		var wg sync.WaitGroup
-		wg.Add(diff)
+		wg.Add(delete)
 		for _, pod := range podsToDelete {
 			go func(targetPod *v1.Pod) {
 				defer wg.Done()
@@ -779,8 +747,39 @@ func (rsc *ReplicaSetController) spotManageReplicas(filteredPods []*v1.Pod, rs *
 				}
 			}(pod)
 		}
+
+		klog.V(2).InfoS("Too few replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "creating", diff)
+		// Batch the pod creates. Batch sizes start at SlowStartInitialBatchSize
+		// and double with each successful iteration in a kind of "slow start".
+		// This handles attempts to start large numbers of pods that would
+		// likely all fail with the same error. For example a project with a
+		// low quota that attempts to create a large number of pods will be
+		// prevented from spamming the API service with the pod create requests
+		// after one of its pods fails.  Conveniently, this also prevents the
+		// event spam that those failures would generate.
+		rs = rs.DeepCopy()
+		successfulCreations, err := rsc.slowStartBatchSpecifyAnnotation(podsToReleased, create, controller.SlowStartInitialBatchSize, rs)
+
+		// Any skipped pods that we never attempted to start shouldn't be expected.
+		// The skipped pods will be retried later. The next controller resync will
+		// retry the slow start process.
+		if skippedPods := diff - successfulCreations; skippedPods > 0 {
+			klog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for %v %v/%v", skippedPods, rsc.Kind, rs.Namespace, rs.Name)
+			for i := 0; i < skippedPods; i++ {
+				// Decrement the expected number of creates because the informer won't observe this pod
+				rsc.expectations.CreationObserved(rsKey)
+			}
+		}
+
+		// 等待删除操作结束
 		wg.Wait()
 
+		// 如果创建出现了错误，直接返回
+		if err != nil {
+			return nil
+		}
+
+		// 再判断删除是否出现了错误
 		select {
 		case err := <-errCh:
 			// all errors have been reported before and they're likely to be the same, so we'll only return the first one we hit.
@@ -789,45 +788,313 @@ func (rsc *ReplicaSetController) spotManageReplicas(filteredPods []*v1.Pod, rs *
 			}
 		default:
 		}
+
+		return err
+
+	} else {
+		// 包含了diff = 0的状况（原rs是不需要处理这种状况的）
+		if diff > rsc.burstReplicas {
+			diff = rsc.burstReplicas
+		}
+		klog.V(2).InfoS("Too many replicas", "replicaSet", klog.KObj(rs), "need", *(rs.Spec.Replicas), "deleting", diff)
+
+		//relatedPods, err := rsc.getIndirectlyRelatedPods(rs)
+		//utilruntime.HandleError(err)
+
+		// Choose which Pods to delete, preferring those in earlier phases of startup.
+
+		// 1. 整个pair在排序后被删除
+		// 2. 对于存在多个new pod的pair, 删除多余的new pod
+		// 3. 对于new pod ready的状况，删除old pod
+		// 4. 对于没有new pod的old pod，需要创建new pod
+		podsToDelete := getPodsToDeleteFromPairs(podPairs, diff)
+		podsToReleased := getPodToReleased(podPairs, diff)
+		delete, create := len(podsToDelete), len(podsToReleased)
+		for _, pod := range podsToDelete {
+			klog.V(4).Infof("Pods to delete are %v", pod.Name)
+		}
+		for _, pod := range podsToReleased {
+			klog.V(4).Infof("Pods to released are %v", pod.Name)
+		}
+
+		// Snapshot the UIDs (ns/name) of the pods we're expecting to see
+		// deleted, so we know to record their expectations exactly once either
+		// when we see it as an update of the deletion timestamp, or as a delete.
+		// Note that if the labels on a pod/rs change in a way that the pod gets
+		// orphaned, the rs will only wake up after the expectations have
+		// expired even if other pods are deleted.
+		rsc.expectations.ExpectCreations(rsKey, create)
+		rsc.expectations.ExpectDeletions(rsKey, getPodKeys(podsToDelete))
+		//rsc.expectations.ExpectDeletions(rsKey, getPodKeys(podsToDelete))
+
+		// todo: 创建和删除操作最好是并行的
+		errCh := make(chan error, diff)
+		var wg sync.WaitGroup
+		wg.Add(delete)
+		for _, pod := range podsToDelete {
+			go func(targetPod *v1.Pod) {
+				defer wg.Done()
+				if err := rsc.podControl.DeletePod(rs.Namespace, targetPod.Name, rs); err != nil {
+					// Decrement the expected number of deletes because the informer won't observe this deletion
+					podKey := controller.PodKey(targetPod)
+					rsc.expectations.DeletionObserved(rsKey, podKey)
+					if !apierrors.IsNotFound(err) {
+						klog.V(2).Infof("Failed to delete %v, decremented expectations for %v %s/%s", podKey, rsc.Kind, rs.Namespace, rs.Name)
+						errCh <- err
+					}
+				}
+			}(pod)
+		}
+
+		rs = rs.DeepCopy()
+		//测试
+		if len(podsToReleased) > 0 {
+			klog.V(4).Infof("Call slowStartBatchSpecifyAnnotation, replace pod %v", podsToReleased[0].Name)
+		}
+		successfulCreations, err := rsc.slowStartBatchSpecifyAnnotation(podsToReleased, create, controller.SlowStartInitialBatchSize, rs)
+
+		if skippedPods := diff - successfulCreations; skippedPods > 0 {
+			klog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for %v %v/%v", skippedPods, rsc.Kind, rs.Namespace, rs.Name)
+			for i := 0; i < skippedPods; i++ {
+				// Decrement the expected number of creates because the informer won't observe this pod
+				rsc.expectations.CreationObserved(rsKey)
+			}
+		}
+
+		// 等待删除操作结束
+		wg.Wait()
+
+		// 如果创建出现了错误，直接返回
+		if err != nil {
+			return nil
+		}
+
+		// 再判断删除是否出现了错误
+		select {
+		case err := <-errCh:
+			// all errors have been reported before and they're likely to be the same, so we'll only return the first one we hit.
+			if err != nil {
+				return err
+			}
+		default:
+		}
+
+		return nil
 	}
 
 	return nil
 }
 
 // 修改
-// Does NOT modify <filteredPods>.
-func (rsc *ReplicaSetController) classifyPod(filterPods []*v1.Pod) map[*v1.Pod][]*v1.Pod {
+// Does NOT modify <filteredPods> 、<filterPodsMap> and <podsPair>.
+func (rsc *ReplicaSetController) classifyPod(filterPods []*v1.Pod) []*controller.PodPair {
 
-	podsPair := make(map[*v1.Pod][]*v1.Pod, 0)
+	podPairsMap := make(map[string]*controller.PodPair, 0)
 	filterPodsMap := make(map[string]*v1.Pod)
 	for _, pod := range filterPods {
 		filterPodsMap[pod.Name] = pod
 	}
 
+	// todo: 一个oldPod 的 newPod,也即将被释放了，该如何处理
 	for _, pod := range filterPods {
 		_, isToBeReleased := pod.Annotations[AnnotationSpotPodReleaseTime]
 		if isToBeReleased {
 			// 如果存在，则证明已经先遍历到了newPod
-			if _, ok := podsPair[pod]; !ok {
-				podsPair[pod] = make([]*v1.Pod, 0)
+			if _, ok := podPairsMap[pod.Name]; !ok {
+				podPairsMap[pod.Name] = &controller.PodPair{pod, make([]*v1.Pod, 0)}
+				//podsPair[pod.Name] = make([]*v1.Pod, 0)
 			}
 			continue
 		}
 
-		if oldpod, hasOld := pod.Annotations[AnnotationSpotPodOldReference]; hasOld {
-			if _, oldExist := podsPair[filterPodsMap[oldpod]]; oldExist {
-				podsPair[filterPodsMap[oldpod]] = append(podsPair[filterPodsMap[oldpod]], pod)
-			} else {
-				podsPair[filterPodsMap[oldpod]] = []*v1.Pod{pod}
+		if oldPodName, hasOld := pod.Annotations[AnnotationSpotPodOldReference]; hasOld {
+			// 如果old不存在，说明老的pod已经被删除了,则直接将自身 添加进去就好了
+			// 如果old存在，说明需要将自身，添加进old的pair里面
+			if oldPod, oldExist := filterPodsMap[oldPodName]; oldExist {
+				if _, oldHasAdd := podPairsMap[oldPodName]; oldHasAdd {
+					podPairsMap[oldPodName].New = append(podPairsMap[oldPodName].New, pod)
+				} else {
+					podPairsMap[oldPodName] = &controller.PodPair{oldPod, []*v1.Pod{pod}}
+				}
+				//if _, oldHasAdd := podsPair[filterPodsMap[oldpod]]; oldHasAdd {
+				//	podsPair[filterPodsMap[oldpod]] = append(podsPair[filterPodsMap[oldpod]], pod)
+				//} else {
+				//	podsPair[filterPodsMap[oldpod]] = []*v1.Pod{pod}
+				//}
+				continue
 			}
-			continue
 		}
 
-		podsPair[pod] = make([]*v1.Pod, 0)
+		podPairsMap[pod.Name] = &controller.PodPair{pod, []*v1.Pod{}}
 	}
 
-	return podsPair
+	podPairs := make([]*controller.PodPair, 0)
+	for _, podPair := range podPairsMap {
+		podPairs = append(podPairs, podPair)
+	}
+
+	return podPairs
 }
+
+func getPodsToDeleteFromPairs(podPairs []*controller.PodPair, diff int) []*v1.Pod {
+	podsToDelete := make([]*v1.Pod, 0)
+	pairsToDelete := make([]*controller.PodPair, 0)
+
+	// 如果全部都要删除，就不用排序了
+	if diff < len(podPairs) {
+		pairsToDelete = getPairsToDelete(podPairs, diff)
+	} else {
+		pairsToDelete = podPairs
+	}
+
+	for _, podpair := range pairsToDelete {
+		if podpair.Old != nil {
+			podsToDelete = append(podsToDelete, podpair.Old)
+		}
+		podsToDelete = append(podsToDelete, podpair.New...)
+	}
+
+	for i := diff; i < len(podPairs); i++ {
+		redundancePods := getRedundancePods(podPairs[i])
+		// 测试
+		if len(redundancePods) > 0 {
+			klog.V(4).Infof("redundancePods is %v", redundancePods[0].Name)
+		} else {
+			klog.V(4).Infof("redundancePods is 0, pair is %v", podPairs[i])
+		}
+
+		podsToDelete = append(podsToDelete, redundancePods...)
+	}
+
+	return podsToDelete
+}
+
+func getRedundancePods(podPair *controller.PodPair) []*v1.Pod {
+	if podPair == nil || len(podPair.New) == 0 {
+		return []*v1.Pod{}
+	}
+	hasReadyPod := false
+
+	redundancePods := make([]*v1.Pod, 0)
+	for _, pod := range podPair.New {
+		if !hasReadyPod {
+			if podutil.IsPodReady(pod) {
+				hasReadyPod = true
+				if podPair.Old != nil {
+					redundancePods = append(redundancePods, podPair.Old)
+				}
+				continue
+			}
+		}
+		redundancePods = append(redundancePods, pod)
+	}
+
+	if hasReadyPod {
+		return redundancePods
+	}
+
+	return redundancePods[1:]
+}
+
+func getPairsToDelete(podPairs []*controller.PodPair, diff int) []*controller.PodPair {
+
+	if diff < len(podPairs) {
+		sort.Sort(controller.ActivePodPairs(podPairs))
+		// todo: 这里需要检查一下，是否是设置为diff，还是说总共要删除的数量
+		//reportSortingDeletionAgeRatioMetric(podsInAccount, diff)
+	}
+	return podPairs[:diff]
+}
+
+func (rsc *ReplicaSetController) getPodsInAccount(podPairs map[string]*controller.PodPair) []*v1.Pod {
+	podsInAccount := make([]*v1.Pod, 0)
+
+	for _, pair := range podPairs {
+		podsInAccount = append(podsInAccount, rsc.choseInPair(pair))
+	}
+	return podsInAccount
+}
+
+// todo:如果存在多个new pod，可能需要更精细的排序
+func (res *ReplicaSetController) choseInPair(pair *controller.PodPair) *v1.Pod {
+	for _, newPod := range pair.New {
+		if podutil.IsPodReady(newPod) {
+			return newPod
+		}
+	}
+	return pair.Old
+}
+
+// read: deleteNum 必须为正数; 函数名需要修改，修改为getPodsNeedCreate
+func getPodToReleased(sortedPodPairs []*controller.PodPair, deleteNum int) []*v1.Pod {
+	podsToReleased := make([]*v1.Pod, 0)
+	for i := deleteNum; i < len(sortedPodPairs); i++ {
+		if isNeedCreateNewPod(sortedPodPairs[i]) {
+			podsToReleased = append(podsToReleased, sortedPodPairs[i].Old)
+		}
+	}
+	return podsToReleased
+}
+
+func isNeedCreateNewPod(podPair *controller.PodPair) bool {
+	if podPair.Old != nil && podPair.Old.Annotations != nil {
+		if _, isToBeReleased := podPair.Old.Annotations[AnnotationSpotPodReleaseTime]; isToBeReleased {
+			if len(podPair.New) == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+//func (rcs *ReplicaSetController) chosePods(podsPair map[string]*controller.PodPair, accountPodsToDelete []*v1.Pod) ([]*v1.Pod, []*v1.Pod) {
+//	podsToDelete := make([]*v1.Pod, 0)
+//	podsToCreate := make([]*v1.Pod, 0)
+//
+//	pairsToDelete := make(map[string]bool)
+//
+//	// 删除podsPair中，即将被删除的pair
+//	for _, pod := range accountPodsToDelete {
+//		if pair, ok := podsPair[pod.Name]; ok {
+//			if pair.Old != nil {
+//				podsToDelete = append(podsToDelete, pair.Old)
+//			}
+//
+//			for _, newPod := range pair.New {
+//				podsToDelete = append(podsToDelete, newPod)
+//			}
+//
+//			pairsToDelete[pod.Name] = true
+//
+//			continue
+//		}
+//
+//		if oldName, ok := pod.Annotations[AnnotationSpotPodOldReference]; ok {
+//			if pair, oldExist := podsPair[oldName]; oldExist {
+//				if pair.Old != nil {
+//					podsToDelete = append(podsToDelete, pair.Old)
+//				}
+//
+//				for _, newPod := range pair.New {
+//					podsToDelete = append(podsToDelete, newPod)
+//				}
+//
+//				pairsToDelete[oldName] = true
+//			}
+//		}
+//	}
+//
+//	// 将需要替换的old pod统计一下
+//	for pairName, pair := range podsPair {
+//		if _, isDelete := pairsToDelete[pairName]; !isDelete {
+//			if pair.Old != nil && len(pair.New) == 0 {
+//				podsToCreate = append(podsToCreate, pair.Old)
+//			}
+//		}
+//	}
+//
+//	return podsToDelete, podsToCreate
+//}
 
 // syncReplicaSet will sync the ReplicaSet with the given key if it has had its expectations fulfilled,
 // meaning it did not expect to see any more of its pods created or deleted. This function is not meant to be
@@ -837,6 +1104,8 @@ func (rsc *ReplicaSetController) syncReplicaSet(key string) error {
 	defer func() {
 		klog.V(4).Infof("Finished syncing %v %q (%v)", rsc.Kind, key, time.Since(startTime))
 	}()
+
+	klog.V(4).Infof("I am syncing")
 
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -878,7 +1147,10 @@ func (rsc *ReplicaSetController) syncReplicaSet(key string) error {
 
 	var manageReplicasErr error
 	if rsNeedsSync && rs.DeletionTimestamp == nil {
-		manageReplicasErr = rsc.manageReplicas(filteredPods, rs)
+		//manageReplicasErr = rsc.manageReplicas(filteredPods, rs)
+		klog.V(4).Infof("Call spotManageReplicas_1")
+		manageReplicasErr = rsc.spotManageReplicas(filteredPods, rs)
+
 	}
 	rs = rs.DeepCopy()
 	newStatus := calculateStatus(rs, filteredPods, manageReplicasErr)
@@ -953,6 +1225,62 @@ func slowStartBatch(count int, initialBatchSize int, fn func() error) (int, erro
 	return successes, nil
 }
 
+// 这里的改造有点不优雅
+func (rsc *ReplicaSetController) slowStartBatchSpecifyAnnotation(podsToBeRealsed []*v1.Pod, count int, initialBatchSize int, rs *apps.ReplicaSet) (int, error) {
+	numNew := count - len(podsToBeRealsed)
+
+	remaining := count
+	successes := 0
+
+	// 测试
+	klog.V(4).Infof("In slowStartBatchSpecifyAnnotation, and start create")
+
+	for batchSize := integer.IntMin(remaining, initialBatchSize); batchSize > 0; batchSize = integer.IntMin(2*batchSize, remaining) {
+		errCh := make(chan error, batchSize)
+		var wg sync.WaitGroup
+		wg.Add(batchSize)
+
+		nowStart := count - remaining
+
+		// 测试
+		klog.V(4).Infof("In slowStartBatchSpecifyAnnotation,Start create batchSize")
+		for i := 0; i < batchSize; i++ {
+			go func(index int) {
+				defer wg.Done()
+				if nowStart+index >= numNew {
+					if rs.Spec.Template.Annotations == nil {
+						rs.Spec.Template.Annotations = make(map[string]string)
+					}
+					rs.Spec.Template.Annotations[AnnotationSpotPodOldReference] = podsToBeRealsed[nowStart+index-numNew].Name
+				}
+
+				err := rsc.podControl.CreatePods(rs.Namespace, &rs.Spec.Template, rs, metav1.NewControllerRef(rs, rsc.GroupVersionKind))
+
+				// 测试
+				if err == nil {
+					klog.V(4).Infof("In slowStartBatchSpecifyAnnotation, Creatting pod")
+				}
+
+				if err != nil {
+					if !apierrors.HasStatusCause(err, v1.NamespaceTerminatingCause) {
+						// if the namespace is being terminated, we don't have to do
+						// anything because any creation will fail
+						errCh <- err
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+		curSuccesses := batchSize - len(errCh)
+		successes += curSuccesses
+		if len(errCh) > 0 {
+			return successes, <-errCh
+		}
+		remaining -= batchSize
+	}
+	return successes, nil
+}
+
 // getIndirectlyRelatedPods returns all pods that are owned by any ReplicaSet
 // that is owned by the given ReplicaSet's owner.
 func (rsc *ReplicaSetController) getIndirectlyRelatedPods(rs *apps.ReplicaSet) ([]*v1.Pod, error) {
@@ -987,6 +1315,17 @@ func (rsc *ReplicaSetController) getIndirectlyRelatedPods(rs *apps.ReplicaSet) (
 }
 
 func getPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
+	// No need to sort pods if we are about to delete all of them.
+	// diff will always be <= len(filteredPods), so not need to handle > case.
+	if diff < len(filteredPods) {
+		podsWithRanks := getPodsRankedByRelatedPodsOnSameNode(filteredPods, relatedPods)
+		sort.Sort(podsWithRanks)
+		reportSortingDeletionAgeRatioMetric(filteredPods, diff)
+	}
+	return filteredPods[:diff]
+}
+
+func getSpotPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
 	// No need to sort pods if we are about to delete all of them.
 	// diff will always be <= len(filteredPods), so not need to handle > case.
 	if diff < len(filteredPods) {

@@ -157,6 +157,290 @@ func newPod(name string, rs *apps.ReplicaSet, status v1.PodPhase, lastTransition
 	}
 }
 
+// 修改
+
+// create a pod with the given phase for the given rs (same selectors and namespace)
+func newSpotPodToReleased(name string, rs *apps.ReplicaSet, status v1.PodPhase, lastTransitionTime *metav1.Time, properlyOwned bool) *v1.Pod {
+	var conditions []v1.PodCondition
+	if status == v1.PodRunning {
+		condition := v1.PodCondition{Type: v1.PodReady, Status: v1.ConditionTrue}
+		if lastTransitionTime != nil {
+			condition.LastTransitionTime = *lastTransitionTime
+		}
+		conditions = append(conditions, condition)
+	}
+	var controllerReference metav1.OwnerReference
+	if properlyOwned {
+		var trueVar = true
+		controllerReference = metav1.OwnerReference{UID: rs.UID, APIVersion: "v1beta1", Kind: "ReplicaSet", Name: rs.Name, Controller: &trueVar}
+	}
+	annotation := make(map[string]string)
+	annotation[AnnotationSpotPodReleaseTime] = time.Now().Format("2006-01-02 15:04:05")
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:             uuid.NewUUID(),
+			Name:            name,
+			Namespace:       rs.Namespace,
+			Labels:          rs.Spec.Selector.MatchLabels,
+			Annotations:     annotation,
+			OwnerReferences: []metav1.OwnerReference{controllerReference},
+		},
+		Status: v1.PodStatus{Phase: status, Conditions: conditions},
+	}
+}
+
+func newPodPair(name string, rs *apps.ReplicaSet, status v1.PodPhase, lastTransitionTime *metav1.Time, properlyOwned bool) controller.PodPair {
+	var conditions []v1.PodCondition
+	if status == v1.PodRunning {
+		condition := v1.PodCondition{Type: v1.PodReady, Status: v1.ConditionTrue}
+		if lastTransitionTime != nil {
+			condition.LastTransitionTime = *lastTransitionTime
+		}
+		conditions = append(conditions, condition)
+	}
+	var controllerReference metav1.OwnerReference
+	if properlyOwned {
+		var trueVar = true
+		controllerReference = metav1.OwnerReference{UID: rs.UID, APIVersion: "v1beta1", Kind: "ReplicaSet", Name: rs.Name, Controller: &trueVar}
+	}
+
+	oldPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:             uuid.NewUUID(),
+			Name:            name,
+			Namespace:       rs.Namespace,
+			Labels:          rs.Spec.Selector.MatchLabels,
+			Annotations:     map[string]string{AnnotationSpotPodReleaseTime: time.Now().Format("2006-01-02 15:04:05")},
+			OwnerReferences: []metav1.OwnerReference{controllerReference},
+		},
+		Status: v1.PodStatus{Phase: status, Conditions: conditions},
+	}
+
+	newPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:             uuid.NewUUID(),
+			Name:            name + "-new",
+			Namespace:       rs.Namespace,
+			Labels:          rs.Spec.Selector.MatchLabels,
+			Annotations:     map[string]string{AnnotationSpotPodOldReference: name},
+			OwnerReferences: []metav1.OwnerReference{controllerReference},
+		},
+		Status: v1.PodStatus{Phase: status, Conditions: conditions},
+	}
+
+	return controller.PodPair{
+		oldPod,
+		[]*v1.Pod{newPod},
+	}
+}
+
+// 修改
+func TestGetSpotPodsToDelete(t *testing.T) {
+	labelMap := map[string]string{"name": "foo"}
+	rs := newReplicaSet(1, labelMap)
+	// an unscheduled, pending pod
+	unscheduledPendingPod := newPod("unscheduled-pending-pod", rs, v1.PodPending, nil, true)
+	// a scheduled, pending pod
+	scheduledPendingPod := newPod("scheduled-pending-pod", rs, v1.PodPending, nil, true)
+	scheduledPendingPod.Spec.NodeName = "fake-node"
+	// a scheduled, running, not-ready pod
+	scheduledRunningNotReadyPod := newPod("scheduled-running-not-ready-pod", rs, v1.PodRunning, nil, true)
+	scheduledRunningNotReadyPod.Spec.NodeName = "fake-node"
+	scheduledRunningNotReadyPod.Status.Conditions = []v1.PodCondition{
+		{
+			Type:   v1.PodReady,
+			Status: v1.ConditionFalse,
+		},
+	}
+	// a scheduled, running, ready pod on fake-node-1
+	scheduledRunningReadyPodOnNode1 := newPod("scheduled-running-ready-pod-on-node-1", rs, v1.PodRunning, nil, true)
+	scheduledRunningReadyPodOnNode1.Spec.NodeName = "fake-node-1"
+	scheduledRunningReadyPodOnNode1.Status.Conditions = []v1.PodCondition{
+		{
+			Type:   v1.PodReady,
+			Status: v1.ConditionTrue,
+		},
+	}
+	// a scheduled, running, ready pod on fake-node-2
+	scheduledRunningReadyPodOnNode2 := newPod("scheduled-running-ready-pod-on-node-2", rs, v1.PodRunning, nil, true)
+	scheduledRunningReadyPodOnNode2.Spec.NodeName = "fake-node-2"
+	scheduledRunningReadyPodOnNode2.Status.Conditions = []v1.PodCondition{
+		{
+			Type:   v1.PodReady,
+			Status: v1.ConditionTrue,
+		},
+	}
+
+	tests := []struct {
+		name string
+		pods []*v1.Pod
+		// related defaults to pods if nil.
+		related              []*v1.Pod
+		diff                 int
+		expectedPodsToDelete []*v1.Pod
+	}{
+		// Order used when selecting pods for deletion:
+		// an unscheduled, pending pod
+		// a scheduled, pending pod
+		// a scheduled, running, not-ready pod
+		// a scheduled, running, ready pod on same node as a related pod
+		// a scheduled, running, ready pod not on node with related pods
+		// Note that a pending pod cannot be ready
+		{
+			name:                 "len(pods) = 0 (i.e., diff = 0 too)",
+			pods:                 []*v1.Pod{},
+			diff:                 0,
+			expectedPodsToDelete: []*v1.Pod{},
+		},
+		{
+			name: "diff = len(pods)",
+			pods: []*v1.Pod{
+				scheduledRunningNotReadyPod,
+				scheduledRunningReadyPodOnNode1,
+			},
+			diff:                 2,
+			expectedPodsToDelete: []*v1.Pod{scheduledRunningNotReadyPod, scheduledRunningReadyPodOnNode1},
+		},
+		{
+			name: "diff < len(pods)",
+			pods: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningNotReadyPod,
+			},
+			diff:                 1,
+			expectedPodsToDelete: []*v1.Pod{scheduledRunningNotReadyPod},
+		},
+		{
+			name: "various pod phases and conditions, diff = len(pods)",
+			pods: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode2,
+				scheduledRunningNotReadyPod,
+				scheduledPendingPod,
+				unscheduledPendingPod,
+			},
+			diff: 6,
+			expectedPodsToDelete: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode2,
+				scheduledRunningNotReadyPod,
+				scheduledPendingPod,
+				unscheduledPendingPod,
+			},
+		},
+		{
+			name: "various pod phases and conditions, diff = len(pods), relatedPods empty",
+			pods: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode2,
+				scheduledRunningNotReadyPod,
+				scheduledPendingPod,
+				unscheduledPendingPod,
+			},
+			related: []*v1.Pod{},
+			diff:    6,
+			expectedPodsToDelete: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode2,
+				scheduledRunningNotReadyPod,
+				scheduledPendingPod,
+				unscheduledPendingPod,
+			},
+		},
+		{
+			name: "scheduled vs unscheduled, diff < len(pods)",
+			pods: []*v1.Pod{
+				scheduledPendingPod,
+				unscheduledPendingPod,
+			},
+			diff: 1,
+			expectedPodsToDelete: []*v1.Pod{
+				unscheduledPendingPod,
+			},
+		},
+		{
+			name: "ready vs not-ready, diff < len(pods)",
+			pods: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningNotReadyPod,
+				scheduledRunningNotReadyPod,
+			},
+			diff: 2,
+			expectedPodsToDelete: []*v1.Pod{
+				scheduledRunningNotReadyPod,
+				scheduledRunningNotReadyPod,
+			},
+		},
+		{
+			name: "ready and colocated with another ready pod vs not colocated, diff < len(pods)",
+			pods: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode2,
+			},
+			related: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode2,
+				scheduledRunningReadyPodOnNode2,
+			},
+			diff: 1,
+			expectedPodsToDelete: []*v1.Pod{
+				scheduledRunningReadyPodOnNode2,
+			},
+		},
+		{
+			name: "pending vs running, diff < len(pods)",
+			pods: []*v1.Pod{
+				scheduledPendingPod,
+				scheduledRunningNotReadyPod,
+			},
+			diff: 1,
+			expectedPodsToDelete: []*v1.Pod{
+				scheduledPendingPod,
+			},
+		},
+		{
+			name: "various pod phases and conditions, diff < len(pods)",
+			pods: []*v1.Pod{
+				scheduledRunningReadyPodOnNode1,
+				scheduledRunningReadyPodOnNode2,
+				scheduledRunningNotReadyPod,
+				scheduledPendingPod,
+				unscheduledPendingPod,
+			},
+			diff: 3,
+			expectedPodsToDelete: []*v1.Pod{
+				unscheduledPendingPod,
+				scheduledPendingPod,
+				scheduledRunningNotReadyPod,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		related := test.related
+		if related == nil {
+			related = test.pods
+		}
+		podsToDelete := getPodsToDelete(test.pods, related, test.diff)
+		// 修改：展示
+		for _, pod := range podsToDelete {
+			fmt.Println(pod.Name)
+		}
+		fmt.Println("----------------------------")
+
+		if len(podsToDelete) != len(test.expectedPodsToDelete) {
+			t.Errorf("%s: unexpected pods to delete, expected %v, got %v", test.name, test.expectedPodsToDelete, podsToDelete)
+		}
+		if !reflect.DeepEqual(podsToDelete, test.expectedPodsToDelete) {
+			t.Errorf("%s: unexpected pods to delete, expected %v, got %v", test.name, test.expectedPodsToDelete, podsToDelete)
+		}
+	}
+}
+
 // create count pods with the given phase for the given ReplicaSet (same selectors and namespace), and add them to the store.
 func newPodList(store cache.Store, count int, status v1.PodPhase, labelMap map[string]string, rs *apps.ReplicaSet, name string) *v1.PodList {
 	pods := []v1.Pod{}
@@ -1782,6 +2066,7 @@ func TestSlowStartBatch(t *testing.T) {
 	}
 }
 
+// 参考
 func TestGetPodsToDelete(t *testing.T) {
 	labelMap := map[string]string{"name": "foo"}
 	rs := newReplicaSet(1, labelMap)
@@ -1973,6 +2258,12 @@ func TestGetPodsToDelete(t *testing.T) {
 			related = test.pods
 		}
 		podsToDelete := getPodsToDelete(test.pods, related, test.diff)
+		// 修改：展示
+		for _, pod := range podsToDelete {
+			fmt.Println(pod.Name)
+		}
+		fmt.Println("----------------------------")
+
 		if len(podsToDelete) != len(test.expectedPodsToDelete) {
 			t.Errorf("%s: unexpected pods to delete, expected %v, got %v", test.name, test.expectedPodsToDelete, podsToDelete)
 		}

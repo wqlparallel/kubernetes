@@ -150,6 +150,7 @@ func ShouldPodBeInEndpoints(pod *v1.Pod, includeTerminating bool) bool {
 		return false
 	}
 
+	// read: 这里需要设置了includeTerminating 才能忽略 pod.DeletionTimestamp
 	if !includeTerminating && pod.DeletionTimestamp != nil {
 		return false
 	}
