@@ -715,8 +715,8 @@ func (rsc *ReplicaSetController) spotManageReplicas(filteredPods []*v1.Pod, rs *
 		//rsc.expectations.ExpectCreations(rsKey, diff)
 		//podsToReleased := getPodToReleased(podPairs, diff)
 		//rsc.expectations.SetExpectations(rsKey, create, delete)
-		podsToDelete := getPodsToDeleteFromPairs(podPairs, diff)
-		podsToReleased := getPodToReleased(podPairs, diff)
+		podsToDelete := getPodsToDeleteFromPairs(podPairs, 0)
+		podsToReleased := getPodToReleased(podPairs, 0)
 		// 测试
 		for _, pod := range podsToDelete {
 			klog.V(4).Infof("Pods to delete are %v", pod.Name)
@@ -973,9 +973,16 @@ func getRedundancePods(podPair *controller.PodPair) []*v1.Pod {
 	if podPair == nil || len(podPair.New) == 0 {
 		return []*v1.Pod{}
 	}
-	hasReadyPod := false
-
 	redundancePods := make([]*v1.Pod, 0)
+
+	if _, isRealse := podPair.Old.Annotations[AnnotationSpotPodReleaseTime]; !isRealse {
+		for _, pod := range podPair.New {
+			redundancePods = append(redundancePods, pod)
+		}
+		return redundancePods
+	}
+
+	hasReadyPod := false
 	for _, pod := range podPair.New {
 		if !hasReadyPod {
 			if podutil.IsPodReady(pod) {
@@ -1004,25 +1011,6 @@ func getPairsToDelete(podPairs []*controller.PodPair, diff int) []*controller.Po
 		//reportSortingDeletionAgeRatioMetric(podsInAccount, diff)
 	}
 	return podPairs[:diff]
-}
-
-func (rsc *ReplicaSetController) getPodsInAccount(podPairs map[string]*controller.PodPair) []*v1.Pod {
-	podsInAccount := make([]*v1.Pod, 0)
-
-	for _, pair := range podPairs {
-		podsInAccount = append(podsInAccount, rsc.choseInPair(pair))
-	}
-	return podsInAccount
-}
-
-// todo:如果存在多个new pod，可能需要更精细的排序
-func (res *ReplicaSetController) choseInPair(pair *controller.PodPair) *v1.Pod {
-	for _, newPod := range pair.New {
-		if podutil.IsPodReady(newPod) {
-			return newPod
-		}
-	}
-	return pair.Old
 }
 
 // read: deleteNum 必须为正数; 函数名需要修改，修改为getPodsNeedCreate
@@ -1225,14 +1213,12 @@ func slowStartBatch(count int, initialBatchSize int, fn func() error) (int, erro
 	return successes, nil
 }
 
-// 这里的改造有点不优雅
 func (rsc *ReplicaSetController) slowStartBatchSpecifyAnnotation(podsToBeRealsed []*v1.Pod, count int, initialBatchSize int, rs *apps.ReplicaSet) (int, error) {
 	numNew := count - len(podsToBeRealsed)
 
 	remaining := count
 	successes := 0
 
-	// 测试
 	klog.V(4).Infof("In slowStartBatchSpecifyAnnotation, and start create")
 
 	for batchSize := integer.IntMin(remaining, initialBatchSize); batchSize > 0; batchSize = integer.IntMin(2*batchSize, remaining) {
@@ -1242,7 +1228,6 @@ func (rsc *ReplicaSetController) slowStartBatchSpecifyAnnotation(podsToBeRealsed
 
 		nowStart := count - remaining
 
-		// 测试
 		klog.V(4).Infof("In slowStartBatchSpecifyAnnotation,Start create batchSize")
 		for i := 0; i < batchSize; i++ {
 			go func(index int) {
@@ -1255,8 +1240,6 @@ func (rsc *ReplicaSetController) slowStartBatchSpecifyAnnotation(podsToBeRealsed
 				}
 
 				err := rsc.podControl.CreatePods(rs.Namespace, &rs.Spec.Template, rs, metav1.NewControllerRef(rs, rsc.GroupVersionKind))
-
-				// 测试
 				if err == nil {
 					klog.V(4).Infof("In slowStartBatchSpecifyAnnotation, Creatting pod")
 				}
@@ -1325,16 +1308,16 @@ func getPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
 	return filteredPods[:diff]
 }
 
-func getSpotPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
-	// No need to sort pods if we are about to delete all of them.
-	// diff will always be <= len(filteredPods), so not need to handle > case.
-	if diff < len(filteredPods) {
-		podsWithRanks := getPodsRankedByRelatedPodsOnSameNode(filteredPods, relatedPods)
-		sort.Sort(podsWithRanks)
-		reportSortingDeletionAgeRatioMetric(filteredPods, diff)
-	}
-	return filteredPods[:diff]
-}
+//func getSpotPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
+//	// No need to sort pods if we are about to delete all of them.
+//	// diff will always be <= len(filteredPods), so not need to handle > case.
+//	if diff < len(filteredPods) {
+//		podsWithRanks := getPodsRankedByRelatedPodsOnSameNode(filteredPods, relatedPods)
+//		sort.Sort(podsWithRanks)
+//		reportSortingDeletionAgeRatioMetric(filteredPods, diff)
+//	}
+//	return filteredPods[:diff]
+//}
 
 func reportSortingDeletionAgeRatioMetric(filteredPods []*v1.Pod, diff int) {
 	now := time.Now()
